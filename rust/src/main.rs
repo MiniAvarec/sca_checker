@@ -32,27 +32,27 @@ static RE_PNPM: Lazy<Regex> = Lazy::new(|| {
 });
 
 static RE_GRADLE_STRING: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"['\"]([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([^'\"]+)['\"]").unwrap()
+    Regex::new(r#"['"]([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([^'"]+)['"]"#).unwrap()
 });
 
 static RE_GRADLE_MAP: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"group:\s*['\"]([^'\"]+)['\"].*?name:\s*['\"]([^'\"]+)['\"].*?version:\s*['\"]([^'\"]+)['\"]").unwrap()
+    Regex::new(r#"group:\s*['"]([^'"]+)['"].*?name:\s*['"]([^'"]+)['"].*?version:\s*['"]([^'"]+)['"]"#).unwrap()
 });
 
 static RE_YARN_VERSION_DQ: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\s+version\s+\"([^\"]+)\"").unwrap()
+    Regex::new(r#"^\s+version\s+"([^"]+)"#).unwrap()
 });
 
 static RE_YARN_VERSION_SQ: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\s+version\s+'([^']+)'"").unwrap()
+    Regex::new(r"^\s+version\s+'([^']+)'").unwrap()
 });
 
 static RE_GEMFILE_LOCK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\s{4}([A-Za-z0-9_.-]+) \(([^)]+)\)").unwrap()
+    Regex::new(r#"^\s{4}([A-Za-z0-9_.-]+) \(([^)]+)\)"#).unwrap()
 });
 
 static RE_GEMFILE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"^\s*gem\s+['\"]([^'\"]+)['\"]\s*(,\s*['\"]([^'\"]+)['\"])?").unwrap()
+    Regex::new("^\\s*gem\\s+['\\\"]([^'\\\"]+)['\\\"]\\s*(,\\s*['\\\"]([^'\\\"]+)['\\\"])?").unwrap()
 });
 
 static LOCAL_IGNORE_DIRS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
@@ -178,7 +178,6 @@ type ParserFn = fn(&str) -> Vec<ParsedDep>;
 
 struct GitLabClient {
     base_url: String,
-    token: String,
     per_page: u32,
     client: Client,
 }
@@ -197,7 +196,6 @@ impl GitLabClient {
             .map_err(|e| e.to_string())?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            token,
             per_page,
             client,
         })
@@ -532,7 +530,7 @@ fn parse_yarn_lock(content: &str) -> Vec<ParsedDep> {
     let mut current_names: Vec<String> = Vec::new();
     let mut current_version: Option<String> = None;
 
-    let mut flush = |deps: &mut Vec<ParsedDep>, names: &mut Vec<String>, version: &mut Option<String>| {
+    let flush = |deps: &mut Vec<ParsedDep>, names: &mut Vec<String>, version: &mut Option<String>| {
         if let (Some(ver), true) = (version.clone(), !names.is_empty()) {
             for n in names.iter() {
                 deps.push(ParsedDep {
@@ -1498,7 +1496,8 @@ fn query_osv(deps: &[Dependency]) -> Result<HashMap<(String, String, String), Ve
             return Err(format!("OSV API error {}", resp.status()));
         }
         let data: Value = resp.json().map_err(|e| e.to_string())?;
-        let results = data.get("results").and_then(|v| v.as_array()).unwrap_or(&vec![]);
+        let empty: Vec<Value> = Vec::new();
+        let results = data.get("results").and_then(|v| v.as_array()).unwrap_or(&empty);
         for (key, result) in key_chunk.iter().zip(results.iter()) {
             let vulns = result.get("vulns").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             if !vulns.is_empty() {
