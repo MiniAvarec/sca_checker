@@ -1,0 +1,20 @@
+{
+  "gitlab": {
+    "base_url": "https://gitlab.com",
+    "token": "PASTE_YOUR_TOKEN_HERE",
+    "group": "your-group-path-or-id"
+  },
+  "scan": {
+    "include_subgroups": true,
+    "per_page": 100,
+    "ignore_projects": [
+      "group/subgroup/project-name",
+      "project-name-only",
+      123456
+    ]
+  },
+  "output": {
+    "inventory_path": "output/dependency_inventory.json",
+    "vulnerability_report_path": "output/vulnerability_report.json"
+  }
+}

@@ -1,0 +1,7 @@
+config.json
+output/
+.venv/
+__pycache__/
+*.pyc
+rust/target/
+target/
