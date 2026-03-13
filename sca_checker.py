@@ -747,17 +747,82 @@ def chunked(items: List[dict], size: int) -> List[List[dict]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def _parse_cvss_score(vector: str) -> Optional[float]:
+    """Extract base score from a CVSS vector string, or parse as plain float."""
+    if not vector:
+        return None
+    try:
+        return float(vector)
+    except (TypeError, ValueError):
+        pass
+    if not vector.upper().startswith("CVSS:"):
+        return None
+    # Only compute score for CVSS 3.x vectors; v4 uses different formula
+    version_part = vector.split("/")[0]  # e.g. "CVSS:3.1"
+    if not version_part.upper().startswith("CVSS:3"):
+        return None
+    metrics: Dict[str, str] = {}
+    for part in vector.split("/"):
+        if ":" in part:
+            k, v = part.rsplit(":", 1)
+            metrics[k] = v
+    av = metrics.get("AV", "N")
+    ac = metrics.get("AC", "L")
+    pr = metrics.get("PR", "N")
+    ui = metrics.get("UI", "N")
+    scope = metrics.get("S", "U")
+    ci = metrics.get("C", "N")
+    ii = metrics.get("I", "N")
+    ai = metrics.get("A", "N")
+    av_w = {"N": 0.85, "A": 0.62, "L": 0.55, "P": 0.20}.get(av, 0.85)
+    ac_w = {"L": 0.77, "H": 0.44}.get(ac, 0.77)
+    pr_map_u = {"N": 0.85, "L": 0.62, "H": 0.27}
+    pr_map_c = {"N": 0.85, "L": 0.68, "H": 0.50}
+    pr_w = (pr_map_c if scope == "C" else pr_map_u).get(pr, 0.85)
+    ui_w = {"N": 0.85, "R": 0.62}.get(ui, 0.85)
+    impact_map = {"H": 0.56, "L": 0.22, "N": 0.0}
+    c_i = impact_map.get(ci, 0.0)
+    i_i = impact_map.get(ii, 0.0)
+    a_i = impact_map.get(ai, 0.0)
+    iss = 1.0 - ((1.0 - c_i) * (1.0 - i_i) * (1.0 - a_i))
+    if iss <= 0:
+        return 0.0
+    exploitability = 8.22 * av_w * ac_w * pr_w * ui_w
+    if scope == "C":
+        impact = 7.52 * (iss - 0.029) - 3.25 * ((iss - 0.02) ** 15)
+    else:
+        impact = 6.42 * iss
+    if impact <= 0:
+        return 0.0
+    raw = exploitability + impact
+    if scope == "C":
+        raw = min(raw * 1.08, 10.0)
+    else:
+        raw = min(raw, 10.0)
+    return round(raw * 10) / 10  # round to 1 decimal
+
+
 def compute_severity(vuln: dict) -> str:
     best_score = None
     best_type = None
     for s in vuln.get("severity", []) or []:
-        try:
-            score = float(s.get("score"))
-        except (TypeError, ValueError):
+        score = _parse_cvss_score(s.get("score"))
+        if score is None:
             continue
+        s_type = s.get("type")
         if best_score is None or score > best_score:
             best_score = score
-            best_type = s.get("type")
+            best_type = s_type
+    # Fallback: database_specific.severity (e.g. GitHub advisories)
+    if best_score is None:
+        db_sev = (vuln.get("database_specific") or {}).get("severity", "")
+        if isinstance(db_sev, str) and db_sev:
+            upper = db_sev.upper()
+            mapping = {"CRITICAL": "CRITICAL", "HIGH": "HIGH",
+                       "MODERATE": "MEDIUM", "MEDIUM": "MEDIUM",
+                       "LOW": "LOW"}
+            if upper in mapping:
+                return mapping[upper]
     if best_score is None:
         return "Unknown"
     label = "LOW"
@@ -775,6 +840,19 @@ def choose_cve(vuln: dict) -> str:
         if alias.startswith("CVE-"):
             return alias
     return vuln.get("id", "UNKNOWN")
+
+
+def _fetch_vuln_details(session: requests.Session, vuln_ids: List[str]) -> Dict[str, dict]:
+    """Fetch full vulnerability details from OSV for a list of IDs."""
+    details: Dict[str, dict] = {}
+    for vuln_id in vuln_ids:
+        try:
+            resp = session.get(f"{OSV_API_BASE}/vulns/{vuln_id}", timeout=30)
+            if resp.status_code < 400:
+                details[vuln_id] = resp.json()
+        except Exception:
+            pass
+    return details
 
 
 def query_osv(deps: List[Dependency]) -> Dict[Tuple[str, str, str], List[dict]]:
@@ -795,6 +873,10 @@ def query_osv(deps: List[Dependency]) -> Dict[Tuple[str, str, str], List[dict]]:
         queries.append({"package": {"name": dep.name, "ecosystem": dep.ecosystem}, "version": dep.version})
         keys.append(key)
 
+    # Step 1: querybatch to find which vulns affect each dep
+    all_vuln_ids: set = set()
+    batch_results: List[Tuple[Tuple[str, str, str], List[dict]]] = []
+
     for chunk, key_chunk in zip(chunked(queries, 500), chunked(keys, 500)):
         payload = {"queries": chunk}
         resp = session.post(f"{OSV_API_BASE}/querybatch", json=payload, timeout=30)
@@ -805,7 +887,24 @@ def query_osv(deps: List[Dependency]) -> Dict[Tuple[str, str, str], List[dict]]:
         for key, result in zip(key_chunk, results):
             vulns = result.get("vulns", []) or []
             if vulns:
-                key_to_vulns[key] = vulns
+                batch_results.append((key, vulns))
+                for v in vulns:
+                    vid = v.get("id")
+                    if vid:
+                        all_vuln_ids.add(vid)
+
+    # Step 2: fetch full details for each unique vuln ID
+    log(f"Fetching details for {len(all_vuln_ids)} vulnerabilities...")
+    vuln_details = _fetch_vuln_details(session, list(all_vuln_ids))
+
+    # Step 3: replace stub entries with full details
+    for key, vulns in batch_results:
+        full_vulns = []
+        for v in vulns:
+            vid = v.get("id")
+            full = vuln_details.get(vid) if vid else None
+            full_vulns.append(full if full else v)
+        key_to_vulns[key] = full_vulns
 
     return key_to_vulns
 
@@ -1088,6 +1187,7 @@ def main() -> int:
                 "osv_link": f"https://osv.dev/vulnerability/{osv_id}",
                 "severity": compute_severity(vuln),
                 "summary": (vuln.get("summary") or "").strip(),
+                "details": (vuln.get("details") or "").strip(),
             }
             issues.append(issue)
 
